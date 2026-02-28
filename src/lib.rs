@@ -273,11 +273,11 @@ impl LogEngine {
                     
                     let bytes = &self.mmap[start_byte..end_byte];
                     
-                    if let Ok(s) = std::str::from_utf8(bytes) {
-                        self.last_block.push_str(s);
-                        if !self.last_block.ends_with('\n') && !self.last_block.is_empty() {
-                            self.last_block.push('\n');
-                        }
+                    // logs are dirty. replace garbage bytes with  instead of failing silently.
+                    let s = String::from_utf8_lossy(bytes);
+                    self.last_block.push_str(&s);
+                    if !self.last_block.ends_with('\n') && !self.last_block.is_empty() {
+                        self.last_block.push('\n');
                     }
                 }
                 Piece::Memory { start_idx, .. } => {
@@ -347,10 +347,10 @@ pub extern "C" fn log_engine_new(path: *const c_char) -> *mut LogEngine {
         return ptr::null_mut();
     }
     let c_str = unsafe { CStr::from_ptr(path) };
-    if let Ok(path_str) = c_str.to_str() {
-        if let Ok(engine) = LogEngine::new(path_str) {
-            return Box::into_raw(Box::new(engine));
-        }
+    // paths can be cursed too on some OSes.
+    let path_str = c_str.to_string_lossy();
+    if let Ok(engine) = LogEngine::new(path_str.as_ref()) {
+        return Box::into_raw(Box::new(engine));
     }
     ptr::null_mut()
 }
@@ -399,12 +399,13 @@ pub extern "C" fn log_engine_apply_edit(
         }
         &mut *engine
     };
+    // nvim might send weird stuff, salvage what we can.
     let text = if new_text.is_null() {
-        ""
+        String::new()
     } else {
-        unsafe { CStr::from_ptr(new_text) }.to_str().unwrap_or("")
+        unsafe { CStr::from_ptr(new_text) }.to_string_lossy().into_owned()
     };
-    engine.apply_edit(start_line, num_deleted, text);
+    engine.apply_edit(start_line, num_deleted, &text);
 }
 
 #[no_mangle]
@@ -418,10 +419,9 @@ pub extern "C" fn log_engine_save(engine: *const LogEngine, path: *const c_char)
     if path.is_null() {
         return false;
     }
-    if let Ok(path_str) = unsafe { CStr::from_ptr(path) }.to_str() {
-        return engine.save(path_str);
-    }
-    false
+    // paths can be cursed too.
+    let path_str = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+    return engine.save(path_str.as_ref());
 }
 
 #[no_mangle]
@@ -476,11 +476,11 @@ pub extern "C" fn log_engine_search(
                 }
             }
             Piece::Memory { start_idx, line_count } => {
-                if let Ok(q_str) = std::str::from_utf8(query_bytes) {
-                    for i in offset..*line_count {
-                        if engine.memory_buffer[start_idx + i].contains(q_str) {
-                            return (current_logical + i - offset) as isize;
-                        }
+                // query might be cursed too.
+                let q_str = String::from_utf8_lossy(query_bytes);
+                for i in offset..*line_count {
+                    if engine.memory_buffer[start_idx + i].contains(q_str.as_ref()) {
+                        return (current_logical + i - offset) as isize;
                     }
                 }
             }
@@ -547,11 +547,11 @@ pub extern "C" fn log_engine_search_backward(
                 }
             }
             Piece::Memory { start_idx, .. } => {
-                if let Ok(q_str) = std::str::from_utf8(query_bytes) {
-                    for i in (0..=offset).rev() {
-                        if engine.memory_buffer[start_idx + i].contains(q_str) {
-                            return (current_logical - offset + i) as isize;
-                        }
+                // query might be cursed too.
+                let q_str = String::from_utf8_lossy(query_bytes);
+                for i in (0..=offset).rev() {
+                    if engine.memory_buffer[start_idx + i].contains(q_str.as_ref()) {
+                        return (current_logical - offset + i) as isize;
                     }
                 }
             }
