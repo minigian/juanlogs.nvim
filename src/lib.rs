@@ -130,7 +130,7 @@ impl LogEngine {
             return self.mmap.len();
         }
         
-        // find the closest chunk behind our target line
+        // find the closest chunk behind our target line (crucial for :LogJump speed)
         let chunk_idx = match self.chunks.binary_search_by_key(&line, |c| c.start_line) {
             Ok(idx) => idx,
             Err(idx) => idx.saturating_sub(1),
@@ -357,6 +357,7 @@ pub extern "C" fn log_engine_new(path: *const c_char) -> *mut LogEngine {
 
 #[no_mangle]
 pub extern "C" fn log_engine_total_lines(engine: *const LogEngine) -> usize {
+    // :LogLines. fast because we already paid the price at startup.
     let engine = unsafe {
         if engine.is_null() {
             return 0;
@@ -373,6 +374,7 @@ pub extern "C" fn log_engine_get_block(
     num_lines: usize,
     out_len: *mut usize,
 ) -> *const u8 {
+    // the thing behind :LogJump and scrolling. fetches chunks without loading the whole file.
     let engine = unsafe {
         if engine.is_null() {
             return ptr::null();
