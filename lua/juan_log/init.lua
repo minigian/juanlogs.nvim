@@ -6,7 +6,8 @@ local config = {
     mode = "dynamic",
     dynamic_chunk_size = 10000,
     dynamic_margin = 2000, -- reload when we get this close to the edge
-    patterns = { "*" }
+    patterns = { "*" },
+    enable_custom_statuscol = true
 }
 
 -- keep this in sync with the rust struct/externs or segfaults will happen.
@@ -145,7 +146,8 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
         bufnr = bufnr,
         engine = engine,
         updating = false, -- semaphore to prevent recursion loops
-        last_query = nil
+        last_query = nil,
+        timer = vim.loop.new_timer()
     }
     _G.JuanLogStates[bufnr] = state
 
@@ -156,7 +158,7 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
     state.updating = false
 
     local winid = vim.fn.bufwinid(bufnr)
-    if winid ~= -1 then
+    if winid ~= -1 and config.enable_custom_statuscol then
         vim.wo[winid].statuscolumn = "%!v:lua._juan_log_statuscol()"
         vim.wo[winid].number = true
     end
@@ -195,50 +197,55 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
         callback = function()
             if state.updating then return end
             
-            local cursor = vim.api.nvim_win_get_cursor(0)
-            local row = cursor[1]
-            local buf_lines = vim.api.nvim_buf_line_count(bufnr)
-            
-            local shift_needed = false
-            local new_offset = state.offset
+            state.timer:stop()
+            state.timer:start(15, 0, vim.schedule_wrap(function()
+                if state.updating or not vim.api.nvim_buf_is_valid(bufnr) then return end
 
-            -- hit bottom margin?
-            if row > (buf_lines - config.dynamic_margin) and (state.offset + buf_lines < state.total) then
-                local shift_amount = math.floor(config.dynamic_chunk_size / 2)
-                new_offset = state.offset + shift_amount
+                local cursor = vim.api.nvim_win_get_cursor(0)
+                local row = cursor[1]
+                local buf_lines = vim.api.nvim_buf_line_count(bufnr)
                 
-                if new_offset + config.dynamic_chunk_size > state.total then
-                    new_offset = state.total - config.dynamic_chunk_size
+                local shift_needed = false
+                local new_offset = state.offset
+
+                -- hit bottom margin?
+                if row > (buf_lines - config.dynamic_margin) and (state.offset + buf_lines < state.total) then
+                    local shift_amount = math.floor(config.dynamic_chunk_size / 2)
+                    new_offset = state.offset + shift_amount
+                    
+                    if new_offset + config.dynamic_chunk_size > state.total then
+                        new_offset = state.total - config.dynamic_chunk_size
+                    end
+                    shift_needed = true
                 end
-                shift_needed = true
-            end
 
-            -- hit top margin?
-            if row < config.dynamic_margin and state.offset > 0 then
-                local shift_amount = math.floor(config.dynamic_chunk_size / 2)
-                new_offset = math.max(0, state.offset - shift_amount)
-                shift_needed = true
-            end
+                -- hit top margin?
+                if row < config.dynamic_margin and state.offset > 0 then
+                    local shift_amount = math.floor(config.dynamic_chunk_size / 2)
+                    new_offset = math.max(0, state.offset - shift_amount)
+                    shift_needed = true
+                end
 
-            if shift_needed and new_offset ~= state.offset then
-                state.updating = true
-                local was_modified = vim.api.nvim_buf_get_option(bufnr, 'modified')
-                
-                local new_lines = fetch_lines(engine, new_offset, config.dynamic_chunk_size)
-                
-                -- swap buffer content seamlessly
-                vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
-                
-                -- adjust cursor relative to the new window
-                local new_row = (state.offset + row) - new_offset
-                new_row = math.max(1, math.min(new_row, #new_lines))
-                
-                vim.api.nvim_win_set_cursor(0, {new_row, cursor[2]})
-                
-                state.offset = new_offset
-                vim.api.nvim_buf_set_option(bufnr, 'modified', was_modified)
-                state.updating = false
-            end
+                if shift_needed and new_offset ~= state.offset then
+                    state.updating = true
+                    local was_modified = vim.api.nvim_buf_get_option(bufnr, 'modified')
+                    
+                    local new_lines = fetch_lines(engine, new_offset, config.dynamic_chunk_size)
+                    
+                    -- swap buffer content seamlessly
+                    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
+                    
+                    -- adjust cursor relative to the new window
+                    local new_row = (state.offset + row) - new_offset
+                    new_row = math.max(1, math.min(new_row, #new_lines))
+                    
+                    vim.api.nvim_win_set_cursor(0, {new_row, cursor[2]})
+                    
+                    state.offset = new_offset
+                    vim.api.nvim_buf_set_option(bufnr, 'modified', was_modified)
+                    state.updating = false
+                end
+            end))
         end
     })
 end
@@ -352,6 +359,11 @@ function M.attach_to_buffer(bufnr, filepath)
     vim.api.nvim_create_autocmd("BufWipeout", {
         buffer = bufnr,
         callback = function()
+            local state = _G.JuanLogStates[bufnr]
+            if state and state.timer then
+                state.timer:stop()
+                state.timer:close()
+            end
             lib.log_engine_free(engine)
             _G.JuanLogStates[bufnr] = nil
         end
