@@ -329,6 +329,24 @@ function M.attach_to_buffer(bufnr, filepath)
             end
         end, { nargs = 1 })
 
+        -- how many lines did we actually parse?
+        vim.api.nvim_buf_create_user_command(bufnr, "LogLines", function()
+            local state = _G.JuanLogStates[bufnr]
+            if state then
+                vim.notify("[JuanLog] Total lines: " .. state.total, vim.log.levels.INFO)
+            end
+        end, {})
+
+        -- teleport to absolute line. vim's native :1234 won't work here.
+        vim.api.nvim_buf_create_user_command(bufnr, "LogJump", function(opts)
+            local state = _G.JuanLogStates[bufnr]
+            if not state then return end
+            local target = tonumber(opts.args)
+            if target and target > 0 and target <= state.total then
+                jump_to_line(bufnr, state, target - 1)
+            end
+        end, { nargs = 1 })
+
         -- remap 'n' and 'N'
         vim.keymap.set("n", "n", function()
             local state = _G.JuanLogStates[bufnr]
@@ -361,6 +379,18 @@ function M.attach_to_buffer(bufnr, filepath)
             if found_line >= 0 then
                 jump_to_line(bufnr, state, found_line)
             end
+        end, { buffer = bufnr, silent = true })
+
+        -- hijack gg to go to the actual start of the file
+        vim.keymap.set("n", "gg", function()
+            local state = _G.JuanLogStates[bufnr]
+            if state then jump_to_line(bufnr, state, 0) end
+        end, { buffer = bufnr, silent = true })
+
+        -- hijack G to go to the actual end of the file
+        vim.keymap.set("n", "G", function()
+            local state = _G.JuanLogStates[bufnr]
+            if state then jump_to_line(bufnr, state, math.max(0, state.total - 1)) end
         end, { buffer = bufnr, silent = true })
     end
 
