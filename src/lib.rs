@@ -7,6 +7,9 @@ use std::io::{BufWriter, Write};
 use std::os::raw::c_char;
 use std::ptr;
 
+// classic piece table implementation.
+// Original = points to the readonly memory mapped file.
+// Memory = points to heap allocated edits.
 #[derive(Clone)]
 enum Piece {
     Original { start_line: usize, line_count: usize },
@@ -33,7 +36,7 @@ pub struct LogEngine {
     original_total_lines: usize,
     pieces: Vec<Piece>,
     memory_buffer: Vec<String>,
-    last_block: String,
+    last_block: String, // persistent buffer to hand out safe pointers to C
 }
 
 impl LogEngine {
@@ -43,6 +46,7 @@ impl LogEngine {
 
         #[cfg(unix)]
         unsafe {
+            // give the OS a heads up. sequential for parsing now, random for actual usage later.
             libc::madvise(
                 mmap.as_ptr() as *mut libc::c_void,
                 mmap.len(),
@@ -55,6 +59,7 @@ impl LogEngine {
             );
         }
 
+        // blast through the file in 1MB chunks to count lines.
         let chunk_size = 1024 * 1024;
         let line_counts: Vec<usize> = mmap
             .par_chunks(chunk_size)
@@ -63,6 +68,7 @@ impl LogEngine {
                 let mut iter = memchr2_iter(b'\n', b'\r', chunk).peekable();
                 while let Some(pos) = iter.next() {
                     count += 1;
+                    // the \r\n check here is slightly cursed but prevents overcounting windows line endings.
                     if chunk[pos] == b'\r' {
                         if let Some(&next_pos) = iter.peek() {
                             if next_pos == pos + 1 && chunk[next_pos] == b'\n' {
@@ -80,6 +86,8 @@ impl LogEngine {
 
         for (i, &count) in line_counts.iter().enumerate() {
             let byte_offset = i * chunk_size;
+            // what happens if \r is at the end of chunk N and \n is at the start of chunk N+1?
+            // this. this happens. adjust the line count so we don't desync.
             if i > 0 && mmap[byte_offset - 1] == b'\r' && mmap.get(byte_offset) == Some(&b'\n') {
                 current_line -= 1;
             }
@@ -92,6 +100,7 @@ impl LogEngine {
 
         let mut original_total_lines = current_line;
         if !mmap.is_empty() {
+            // handle files without a trailing newline
             let last_byte = mmap.last().copied();
             if last_byte != Some(b'\n') && last_byte != Some(b'\r') {
                 original_total_lines += 1;
@@ -120,19 +129,24 @@ impl LogEngine {
         if line >= self.original_total_lines {
             return self.mmap.len();
         }
+        
+        // find the closest chunk behind our target line
         let chunk_idx = match self.chunks.binary_search_by_key(&line, |c| c.start_line) {
             Ok(idx) => idx,
             Err(idx) => idx.saturating_sub(1),
         };
+        
         let chunk = &self.chunks[chunk_idx];
         let mut offset = chunk.byte_offset;
         let mut skip = line - chunk.start_line;
+        
+        // walk the rest of the bytes manually until we hit the exact line
         while skip > 0 && offset < self.mmap.len() {
             let slice = &self.mmap[offset..];
             if let Some(pos) = memchr2(b'\n', b'\r', slice) {
                 offset += pos + 1;
                 if slice[pos] == b'\r' && offset < self.mmap.len() && self.mmap[offset] == b'\n' {
-                    offset += 1;
+                    offset += 1; // skip the \n of a \r\n pair
                 }
                 skip -= 1;
             } else {
@@ -156,6 +170,7 @@ impl LogEngine {
         self.pieces.iter().map(|p| p.line_count()).sum()
     }
 
+    // returns (piece_index, line_offset_inside_piece)
     fn find_piece_idx(&self, logical_line: usize) -> (usize, usize) {
         let mut current = 0;
         for (i, piece) in self.pieces.iter().enumerate() {
@@ -206,12 +221,15 @@ impl LogEngine {
         }
 
         let mut remaining_delete = num_deleted;
+        
+        // nuke pieces fully contained in the deletion range
         while remaining_delete > 0 && piece_idx < self.pieces.len() {
             let count = self.pieces[piece_idx].line_count();
             if count <= remaining_delete {
                 self.pieces.remove(piece_idx);
                 remaining_delete -= count;
             } else {
+                // partial overlap, split and drop the front
                 self.split_piece_at(piece_idx, remaining_delete);
                 self.pieces.remove(piece_idx);
                 remaining_delete = 0;
@@ -220,6 +238,7 @@ impl LogEngine {
 
         if !new_text.is_empty() {
             let mut lines: Vec<String> = new_text.split('\n').map(|s| s.to_string()).collect();
+            // drop the trailing empty string from split if it exists
             if lines.last().map(|s| s.is_empty()).unwrap_or(false) {
                 lines.pop();
             }
@@ -241,6 +260,7 @@ impl LogEngine {
         let (mut piece_idx, mut offset) = self.find_piece_idx(start_line);
         let mut collected = 0;
 
+        // stitch together pieces until we satisfy the requested line count
         while collected < num_lines && piece_idx < self.pieces.len() {
             let piece = &self.pieces[piece_idx];
             let count = piece.line_count() - offset;
@@ -248,7 +268,6 @@ impl LogEngine {
 
             match piece {
                 Piece::Original { start_line: p_start, .. } => {
-
                     let start_byte = self.line_to_byte_offset(p_start + offset);
                     let end_byte = self.line_to_byte_offset(p_start + offset + take);
                     
@@ -273,6 +292,7 @@ impl LogEngine {
             piece_idx += 1;
         }
 
+        // C side expects a pointer. this gets overwritten next call, DO NOT keep it around.
         self.last_block.as_ptr()
     }
 
@@ -313,9 +333,13 @@ impl LogEngine {
         if writer.flush().is_err() {
             return false;
         }
+        // atomic swap
         std::fs::rename(&temp_path, path).is_ok()
     }
 }
+
+// --- C ABI Boundary ---
+// Trusting the caller from here on out. standard unsafe boilerplate.
 
 #[no_mangle]
 pub extern "C" fn log_engine_new(path: *const c_char) -> *mut LogEngine {
@@ -432,6 +456,9 @@ pub extern "C" fn log_engine_search(
             Piece::Original { start_line: p_start, line_count } => {
                 let bytes = engine.get_original_bytes(p_start + offset, line_count - offset);
                 if let Some(pos) = memmem::find(bytes, query_bytes) {
+                    
+                    // found the byte offset, now manually count newlines up to this point
+                    // to resolve the actual logical line number. slow but accurate.
                     let slice_to_match = &bytes[..pos];
                     let mut lines = 0;
                     let mut iter = memchr2_iter(b'\n', b'\r', slice_to_match).peekable();
@@ -464,6 +491,7 @@ pub extern "C" fn log_engine_search(
     }
     -1
 }
+
 #[no_mangle]
 pub extern "C" fn log_engine_search_backward(
     engine: *const LogEngine,
@@ -495,6 +523,7 @@ pub extern "C" fn log_engine_search_backward(
 
     let mut current_logical = start_line;
 
+    // walking backwards through pieces. same logic as forward search but reversed.
     loop {
         let piece = &engine.pieces[piece_idx];
         match piece {
@@ -542,6 +571,7 @@ pub extern "C" fn log_engine_search_backward(
 pub extern "C" fn log_engine_free(engine: *mut LogEngine) {
     if !engine.is_null() {
         unsafe {
+            // reclaim ownership and let Rust's drop cleanup the memory
             let _ = Box::from_raw(engine);
         }
     }
