@@ -364,7 +364,7 @@ function M.setup(user_config)
     vim.api.nvim_create_autocmd("BufReadCmd", {
         pattern = config.patterns,
         callback = function(ev)
-            local file = ev.match
+            local file = vim.fn.expand("<amatch>:p") -- absolute path
             local stat = vim.loop.fs_stat(file)
 
             if not stat or stat.type == "directory" then
