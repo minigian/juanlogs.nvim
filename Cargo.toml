@@ -1,0 +1,16 @@
+[package]
+name = "juanlog"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "juanlog"
+crate-type = ["cdylib"]
+
+[dependencies]
+memchr = "2.7"
+memmap2 = "0.9"
+rayon = "1.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
