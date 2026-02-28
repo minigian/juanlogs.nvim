@@ -7,7 +7,8 @@ local config = {
     dynamic_chunk_size = 10000,
     dynamic_margin = 2000, -- reload when we get this close to the edge
     patterns = { "*" },
-    enable_custom_statuscol = true
+    enable_custom_statuscol = true,
+    syntax = false
 }
 
 -- keep this in sync with the rust struct/externs or segfaults will happen.
@@ -267,7 +268,14 @@ function M.attach_to_buffer(bufnr, filepath)
     vim.api.nvim_buf_set_name(bufnr, filepath)
     
     -- turn off expensive stuff for huge files
-    pcall(function() vim.opt_local.syntax = "off" end)
+    if not config.syntax then
+        pcall(function() vim.opt_local.syntax = "off" end)
+    else
+        local ft = vim.filetype.match({ filename = filepath })
+        if ft then
+            vim.api.nvim_buf_set_option(bufnr, 'filetype', ft)
+        end
+    end
     pcall(function() vim.opt_local.spell = false end)
 
     if config.mode == "load_all" then
