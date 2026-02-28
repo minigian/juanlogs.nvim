@@ -2,13 +2,14 @@ local ffi = require("ffi")
 local M = {}
 
 local config = {
-    threshold_size = 1024 * 1024 * 100,
+    threshold_size = 1024 * 1024 * 100, -- 100MB trigger
     mode = "dynamic",
     dynamic_chunk_size = 10000,
-    dynamic_margin = 2000,
+    dynamic_margin = 2000, -- reload when we get this close to the edge
     patterns = { "*" }
 }
 
+-- keep this in sync with the rust struct/externs or segfaults will happen.
 ffi.cdef [[
     typedef struct LogEngine LogEngine;
     LogEngine* log_engine_new(const char* path);
@@ -26,11 +27,13 @@ local function get_lib_path()
     local ext = sysname == "Windows_NT" and "dll" or (sysname == "Darwin" and "dylib" or "so")
     local lib_name = "libjuanlog." .. ext
 
+    -- check local dev path first, useful for debugging without reinstalling
     local local_dev_path = vim.fn.stdpath("config") .. "/lua/juan_log/bin/" .. lib_name
     if vim.loop.fs_stat(local_dev_path) then
         return local_dev_path
     end
 
+    -- fallback to release path
     local str = debug.getinfo(1, "S").source:sub(2)
     local plugin_root = str:match("(.*[/\\])"):gsub("lua[/\\]juan_log[/\\]$", "")
     return plugin_root .. "target/release/" .. lib_name
@@ -46,8 +49,11 @@ if not ok then
     lib = nil
 end
 
+-- global state to map buffers to rust engines
 _G.JuanLogStates = _G.JuanLogStates or {}
 
+-- custom status column to fake absolute line numbers.
+-- since the buffer only holds a small chunk, 'lnum' is wrong relative to the file.
 _G._juan_log_statuscol = function()
     local winid = vim.g.statusline_winid or vim.api.nvim_get_current_win()
     local b = vim.api.nvim_win_get_buf(winid)
@@ -61,6 +67,7 @@ end
 
 local function fetch_lines(engine, start, count)
     local len_ptr = ffi.new("size_t[1]")
+    -- this pointer is only valid until the next call to rust. copy immediately.
     local block_ptr = lib.log_engine_get_block(engine, start, count, len_ptr)
     
     if block_ptr == nil then return {} end
@@ -70,6 +77,7 @@ local function fetch_lines(engine, start, count)
 
     local raw_text = ffi.string(block_ptr, length)
     
+    -- clean up trailing newlines from the block fetch
     if raw_text:sub(-1) == "\n" then raw_text = raw_text:sub(1, -2) end
     if raw_text:sub(-1) == "\r" then raw_text = raw_text:sub(1, -2) end
     
@@ -80,6 +88,7 @@ local function load_all_lines(bufnr, engine, total_lines)
     local chunk_size = 50000 
     local loaded = 0
     
+    -- disable undo history or nvim RAM usage will skyrocket
     vim.api.nvim_buf_set_option(bufnr, 'undolevels', -1)
     
     while loaded < total_lines do
@@ -92,6 +101,7 @@ local function load_all_lines(bufnr, engine, total_lines)
         
         loaded = loaded + to_fetch
         
+        -- force a redraw every few chunks so the UI doesn't freeze completely
         if loaded % (chunk_size * 5) == 0 then
             vim.cmd("redraw")
         end
@@ -100,6 +110,7 @@ local function load_all_lines(bufnr, engine, total_lines)
     vim.api.nvim_buf_set_option(bufnr, 'modified', false)
 end
 
+-- "teleport" the visible window to a new location in the huge file
 local function jump_to_line(bufnr, state, found_line)
     local half_chunk = math.floor(config.dynamic_chunk_size / 2)
     local new_offset = math.max(0, found_line - half_chunk)
@@ -112,6 +123,7 @@ local function jump_to_line(bufnr, state, found_line)
     local was_modified = vim.api.nvim_buf_get_option(bufnr, 'modified')
     local new_lines = fetch_lines(state.engine, new_offset, config.dynamic_chunk_size)
     
+    -- replace the entire buffer content
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
 
     local new_row = (found_line - new_offset) + 1
@@ -132,7 +144,7 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
         total = total_lines,
         bufnr = bufnr,
         engine = engine,
-        updating = false,
+        updating = false, -- semaphore to prevent recursion loops
         last_query = nil
     }
     _G.JuanLogStates[bufnr] = state
@@ -149,6 +161,7 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
         vim.wo[winid].number = true
     end
 
+    -- listen for edits and send them to the rust piece table
     vim.api.nvim_buf_attach(bufnr, false, {
         on_lines = function(_, _, _, firstline, lastline, new_lastline)
             if state.updating then return end
@@ -164,6 +177,7 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
         end
     })
 
+    -- hijack save command
     vim.api.nvim_create_autocmd("BufWriteCmd", {
         buffer = bufnr,
         callback = function()
@@ -174,6 +188,8 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
         end
     })
 
+    -- infinite scrolling magic. 
+    -- if cursor hits the margin, fetch next/prev chunk and shift everything.
     vim.api.nvim_create_autocmd({"CursorMoved", "CursorMovedI"}, {
         buffer = bufnr,
         callback = function()
@@ -186,6 +202,7 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
             local shift_needed = false
             local new_offset = state.offset
 
+            -- hit bottom margin?
             if row > (buf_lines - config.dynamic_margin) and (state.offset + buf_lines < state.total) then
                 local shift_amount = math.floor(config.dynamic_chunk_size / 2)
                 new_offset = state.offset + shift_amount
@@ -196,6 +213,7 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
                 shift_needed = true
             end
 
+            -- hit top margin?
             if row < config.dynamic_margin and state.offset > 0 then
                 local shift_amount = math.floor(config.dynamic_chunk_size / 2)
                 new_offset = math.max(0, state.offset - shift_amount)
@@ -208,8 +226,10 @@ local function setup_dynamic_window(bufnr, engine, total_lines, filepath)
                 
                 local new_lines = fetch_lines(engine, new_offset, config.dynamic_chunk_size)
                 
+                -- swap buffer content seamlessly
                 vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, new_lines)
                 
+                -- adjust cursor relative to the new window
                 local new_row = (state.offset + row) - new_offset
                 new_row = math.max(1, math.min(new_row, #new_lines))
                 
@@ -239,6 +259,7 @@ function M.attach_to_buffer(bufnr, filepath)
     vim.api.nvim_buf_set_option(bufnr, 'swapfile', false)
     vim.api.nvim_buf_set_name(bufnr, filepath)
     
+    -- turn off expensive stuff for huge files
     pcall(function() vim.opt_local.syntax = "off" end)
     pcall(function() vim.opt_local.spell = false end)
 
@@ -247,6 +268,8 @@ function M.attach_to_buffer(bufnr, filepath)
     else
         setup_dynamic_window(bufnr, engine, total_lines, filepath)
         
+        -- standard / search won't work because lines aren't loaded.
+        -- implementing custom search commands that query the engine.
         vim.api.nvim_buf_create_user_command(bufnr, "Logfind", function(opts)
             local state = _G.JuanLogStates[bufnr]
             if not state then return end
@@ -258,6 +281,8 @@ function M.attach_to_buffer(bufnr, filepath)
 
             local cursor = vim.api.nvim_win_get_cursor(0)
             local current_line_idx = state.offset + cursor[1] - 1 
+            
+            -- try to find the closest match (up or down)
             local start_down = current_line_idx + 1
             local found_down = tonumber(lib.log_engine_search(state.engine, query, start_down))
 
@@ -289,6 +314,7 @@ function M.attach_to_buffer(bufnr, filepath)
             end
         end, { nargs = 1 })
 
+        -- remap 'n' and 'N'
         vim.keymap.set("n", "n", function()
             local state = _G.JuanLogStates[bufnr]
             if not state or not state.last_query then return end
@@ -345,6 +371,7 @@ function M.setup(user_config)
                 return
             end
 
+            -- hijack huge files, pass small ones to standard vim
             if stat.size > config.threshold_size then
                 vim.schedule(function()
                     if vim.api.nvim_buf_is_valid(ev.buf) then
@@ -359,6 +386,7 @@ function M.setup(user_config)
                         local was_modifiable = vim.api.nvim_buf_get_option(ev.buf, 'modifiable')
                         vim.api.nvim_buf_set_option(ev.buf, 'modifiable', true)
                         
+                        -- fallback: just read it normally
                         vim.cmd('silent! read ' .. vim.fn.fnameescape(file))
                         vim.cmd('1delete _')
                         
