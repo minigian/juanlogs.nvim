@@ -3,7 +3,7 @@
 
 
 A high-performance log viewer for Neovim, powered by Rust and Piece Tables.
-It can open and search through 50GB+ files instantly without freezing Neovim.
+It can open and search through 50GB+ files instantly (well, not yet but maybe in the future) without crashing Neovim.
 
 ## Should you use it?
 If you regularly open logs, database dumps, or CSVs larger than 100MB and Neovim freezes, crashes, or eats all your RAM, yes. If you only deal with small files, standard Neovim is already perfectly fine.
