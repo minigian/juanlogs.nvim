@@ -1,5 +1,7 @@
 # juan-log.nvim
 ![Juan](https://static.wikia.nocookie.net/mamarre-estudios-espanol/images/a/a3/FB_IMG_1596591789564.jpg/revision/latest?cb=20200806023457&path-prefix=es)
+
+
 A high-performance log viewer for Neovim, powered by Rust and Piece Tables.
 It can open and search through 50GB+ files instantly without freezing Neovim.
 
